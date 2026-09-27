@@ -718,8 +718,8 @@ function renderSettingsTab(panel, section = '') {
             if (el.type === 'checkbox') value = el.checked;
             else if (el.dataset.type === 'number') {
                 value = Number(el.value);
-                const min = el.min !== '' ? Number(el.min) : -Infinity;
-                const max = el.max !== '' ? Number(el.max) : Infinity;
+                const min = el.getAttribute('min') ? Number(el.min) : -Infinity;
+                const max = el.getAttribute('max') ? Number(el.max) : Infinity;
                 if (el.value === '' || !Number.isFinite(value)) value = getPath(DEFAULTS, path);
                 value = Math.min(max, Math.max(min, value));
             } else value = el.value;
