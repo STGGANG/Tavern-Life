@@ -128,7 +128,8 @@
     width: min(92vw, 380px);
     height: 100vh;
     height: 100dvh;
-    padding: calc(var(--topBarBlockSize, 50px) + 10px) 0 20px;
+    padding: max(calc(var(--topBarBlockSize, 50px) + 10px), var(--tlr-toast-offset, 0px)) 0 20px;
+    transition: padding-top .2s ease;
     pointer-events: none;
     display: flex;
     flex-direction: column;

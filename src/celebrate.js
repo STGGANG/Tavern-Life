@@ -101,6 +101,33 @@ function iconHtml(icon) {
 const BUNDLE_AT = 4;
 let current = null;
 
+// 실리태번 토스트가 떠 있으면 카드를 그 아래로 내림 (카드가 떠 있는 동안만 지켜봄)
+let toastObserver = null;
+function placeBelowToasts() {
+    const host = document.getElementById('tlr-card-host');
+    if (!host) return;
+    const hostBox = host.getBoundingClientRect();
+    let bottom = 0;
+    document.querySelectorAll('#toast-container > .toast').forEach(t => {
+        const r = t.getBoundingClientRect();
+        if (r.height && r.left < hostBox.right && r.right > hostBox.left) bottom = Math.max(bottom, r.bottom);
+    });
+    if (bottom) host.style.setProperty('--tlr-toast-offset', `${Math.ceil(bottom) + 8}px`);
+    else host.style.removeProperty('--tlr-toast-offset');
+}
+function watchToasts(on) {
+    if (!on) {
+        toastObserver?.disconnect();
+        toastObserver = null;
+        document.getElementById('tlr-card-host')?.style.removeProperty('--tlr-toast-offset');
+        return;
+    }
+    if (toastObserver) return;
+    toastObserver = new MutationObserver(() => requestAnimationFrame(placeBelowToasts));
+    toastObserver.observe(document.body, { childList: true, subtree: true });
+    requestAnimationFrame(placeBelowToasts);
+}
+
 export function showCard(card) {
     if (card.key && (current?.key === card.key || queue.some(c => c.key === card.key || c.items?.some(x => x.key === card.key)))) return;
     queue.push(card);
@@ -150,6 +177,7 @@ function nextCard() {
         return;
     }
     showing = true;
+    watchToasts(true);
     let host = document.getElementById('tlr-card-host');
     if (!host) {
         host = document.createElement('div');
@@ -177,6 +205,7 @@ function nextCard() {
         el.classList.add('tlr-card-out');
         setTimeout(() => {
             el.remove();
+            if (!queue.length) watchToasts(false);
             setTimeout(nextCard, 150);
         }, 280);
     };
