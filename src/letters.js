@@ -110,12 +110,15 @@ function resolveConnection() {
     const c = ctx();
     const pref = getSettings().letters.connection || 'auto';
     const profiles = connectionProfiles();
+    const asProfile = (p) => ({ kind: 'profile', id: p.id, mode: p.mode === 'tc' ? 'tc' : 'cc', preset: p.preset, api: p.api, model: p.model });
     if (pref !== 'auto' && pref !== 'main') {
-        if (profiles.some(p => p.id === pref)) return { kind: 'profile', id: pref };
+        const p = profiles.find(x => x.id === pref);
+        if (p) return asProfile(p);
     }
     if (pref !== 'main') {
         const sel = c.extensionSettings?.connectionManager?.selectedProfile;
-        if (sel && profiles.some(p => p.id === sel)) return { kind: 'profile', id: sel };
+        const p = sel && profiles.find(x => x.id === sel);
+        if (p) return asProfile(p);
     }
     if (c.onlineStatus && c.onlineStatus !== 'no_connection') return { kind: 'main' };
     return null;
@@ -130,10 +133,21 @@ const wrap = (tag, content, attrs = '') => `<${tag}${attrs}>\n${String(content).
 const attr = (v) => String(v).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 
 const WRAPPER_LINE = /^<\/?(?:letter|output|output_format|task|answer|response|result|translation|source_text)>\s*$/i;
+const OUTPUT_MAX_CHARS = 12000; // 폭주한 출력만 막는 안전장치 (보통 편지는 1~2천 자)
+
+/** 앞쪽의 생각(thinking) 블록 제거. 닫히지 않은 채 시작하면 = 생각하다 끊김 → 본문 없음 */
+function stripThinking(text) {
+    let t = String(text || '');
+    let prev;
+    do {
+        prev = t;
+        t = t.replace(/^\s*<(think|thinking|reasoning)>[\s\S]*?<\/\1>\s*/i, '');
+    } while (t !== prev);
+    return /^\s*<(?:think|thinking|reasoning)>/i.test(t) ? '' : t;
+}
 
 function cleanOutput(text, emptyMsg) {
-    let t = String(text || '');
-    t = t.replace(/^\s*<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>\s*/i, '');
+    let t = stripThinking(text);
     t = t.replace(/^\s*```[a-z]*\s*\n?/i, '').replace(/\n?```\s*$/, '');
     const lines = t.trim().split('\n');
     while (lines.length && WRAPPER_LINE.test(lines[0].trim())) lines.shift();
@@ -141,7 +155,7 @@ function cleanOutput(text, emptyMsg) {
     t = lines.join('\n').replace(/\n{3,}/g, '\n\n').trim();
     if (/^["“][\s\S]*["”]$/.test(t)) t = t.slice(1, -1).trim();
     if (!t) throw new Error(emptyMsg);
-    return t.length > 6000 ? t.slice(0, 6000) : t;
+    return t.length > OUTPUT_MAX_CHARS ? `${t.slice(0, OUTPUT_MAX_CHARS).trimEnd()}…` : t;
 }
 
 function mainResponseTokens() {
@@ -239,7 +253,52 @@ function buildLetterPrompt(snap, ch, mode, days, maxTokens) {
     ];
 }
 
-const PROFILE_MAX_TOKENS = 2048;
+// 연결 프로필 경로의 출력 상한.
+// 우리가 넘긴 값이 프로필 프리셋의 값을 덮어쓰고, thinking 예산도 이 값의 비율로 잘려 나가므로
+// 고정값 대신 "그 프로필로 채팅할 때 쓰는 값"을 따른다. 예전 고정값(2048)보다 작게는 내리지 않는다.
+const PROFILE_MIN_TOKENS = 2048;
+const RETRY_MAX_TOKENS = 16384;
+const FALLBACK_MAX_TOKENS = 8192; // 다른 모델인데 프리셋 값도 없을 때만. 이보다 크면 거절하는 모델이 있음
+
+/** 지금 채팅에 쓰는 연결과 같은 API·모델인지. 같으면 지금 쓰는 출력 길이 값은 그 모델이 받는 값 */
+function isMainConnection(conn) {
+    const c = ctx();
+    try {
+        const source = c.CONNECT_API_MAP?.[conn.api]?.source;
+        return !!(source && conn.model && c.mainApi === 'openai'
+            && c.chatCompletionSettings?.chat_completion_source === source
+            && c.getChatCompletionModel?.() === conn.model);
+    } catch {
+        return false;
+    }
+}
+
+function profileMaxTokens(conn) {
+    const c = ctx();
+    let configured = 0;
+    if (conn.mode === 'tc') {
+        // 텍스트 완성은 프롬프트와 합쳐 문맥 길이를 넘지 않게 문맥의 절반까지만
+        configured = Number(document.getElementById('amount_gen')?.value) || 0;
+        const maxContext = Number(c.maxContext) || 0;
+        if (maxContext) configured = Math.min(configured, Math.floor(maxContext / 2));
+    } else {
+        try {
+            const preset = conn.preset ? c.getPresetManager?.('openai')?.getCompletionPresetByName(conn.preset) : null;
+            configured = Number(preset?.openai_max_tokens) || 0;
+        } catch { }
+        const live = Number(c.chatCompletionSettings?.openai_max_tokens) || 0;
+        if (isMainConnection(conn)) configured = Math.max(configured, live);
+        else if (!configured) configured = Math.min(live, FALLBACK_MAX_TOKENS);
+    }
+    return Math.max(PROFILE_MIN_TOKENS, configured);
+}
+
+/** API가 "길이 한도에서 끊겼다"고 명시한 경우만 (Gemini·Claude 직결은 실리태번이 이 정보를 넘기지 않음) */
+function hitLengthLimit(data) {
+    const choice = data?.choices?.[0];
+    const reason = choice?.finish_reason ?? choice?.finishReason;
+    return reason === 'length' || reason === 'max_tokens' || data?.stop_reason === 'max_tokens' || data?.candidates?.[0]?.finishReason === 'MAX_TOKENS';
+}
 
 const PAPERS = [
     { id: 'cream', hint: 'warm plain cream' },
@@ -251,13 +310,48 @@ const PAPERS = [
     { id: 'midnight', hint: 'dark navy with light ink' },
 ];
 
+const isPaper = (id) => PAPERS.some(p => p.id === id);
+const PAPER_BRACKET = /\*{0,2}\[[ \t]*paper[ \t]*[:：][ \t]*([a-z]+)[ \t]*\]\*{0,2}/i;
+const PAPER_HEAD = 400;
+
+/** 편지지 태그 위치. 앞부분 → (괄호 없이 줄 맨 앞에 쓴 경우) → 끝부분 순으로 찾는다 */
+function findPaperTag(text) {
+    const head = text.slice(0, PAPER_HEAD);
+    let m = PAPER_BRACKET.exec(head);
+    if (m) return { index: m.index, length: m[0].length, id: m[1].toLowerCase() };
+    const lead = /(^|\n)([ \t]*\[?[ \t]*paper[ \t]*[:：][ \t]*([a-z]+)\b\]?)/i.exec(head);
+    if (lead && isPaper(lead[3].toLowerCase())) return { index: lead.index + lead[1].length, length: lead[2].length, id: lead[3].toLowerCase() };
+    const tailStart = Math.max(PAPER_HEAD, text.length - 300);
+    m = PAPER_BRACKET.exec(text.slice(tailStart));
+    if (m) return { index: tailStart + m.index, length: m[0].length, id: m[1].toLowerCase() };
+    return null;
+}
+
+/** 태그만 떼어낸다. 같은 줄의 인사말 등 나머지 내용은 그대로 둔다 */
 function takePaper(raw) {
-    const text = String(raw || '').replace(/^\s*<think(?:ing)?>[\s\S]*?<\/think(?:ing)?>\s*/i, '');
-    const m = /^\s*\[?[ \t]*paper[ \t]*:[ \t]*([a-z]+)[ \t]*\]?[^\n]*\n?/i.exec(text);
-    const id = m?.[1]?.toLowerCase();
+    const text = stripThinking(raw);
+    const tag = findPaperTag(text);
+    if (!tag) return { paper: 'cream', body: text };
+    const rest = text.slice(tag.index + tag.length)
+        .replace(/^[ \t]*\([^)\n]{0,80}\)/, '') // 태그 뒤에 따라 쓴 설명 "(warm plain cream)"
+        .replace(/^[ \t]*\r?\n/, ''); // 태그만 있던 줄이면 그 줄바꿈도
+    return { paper: isPaper(tag.id) ? tag.id : 'cream', body: text.slice(0, tag.index) + rest };
+}
+
+async function profileRequest(conn, messages, maxTokens) {
+    const c = ctx();
+    const svc = c.ConnectionManagerRequestService;
+    const opts = { stream: false, includePreset: true, includeInstruct: true };
+    // 텍스트 완성은 실리태번이 추출하면서 해주는 종료 시퀀스·인스트럭트 정리가 꼭 필요해서 그대로 받는다
+    if (conn.mode === 'tc' || typeof c.extractMessageFromData !== 'function') {
+        const res = await svc.sendRequest(conn.id, messages, maxTokens, { ...opts, extractData: true });
+        return { text: typeof res === 'string' ? res : res?.content, truncated: false };
+    }
+    // 원본 응답을 받아 끊김 여부까지 확인 (본문 추출은 실리태번 함수 그대로)
+    const data = await svc.sendRequest(conn.id, messages, maxTokens, { ...opts, extractData: false });
     return {
-        paper: PAPERS.some(p => p.id === id) ? id : 'cream',
-        body: m ? text.slice(m[0].length) : text,
+        text: c.extractMessageFromData(data, 'openai'),
+        truncated: hitLengthLimit(data),
     };
 }
 
@@ -265,12 +359,30 @@ async function requestText(messages, conn) {
     const c = ctx();
     if (conn.kind === 'profile') {
         // 연결 프로필 경로: 전역 설정을 건드리지 않고, 다른 확장의 프롬프트 이벤트도 타지 않음
-        const res = await c.ConnectionManagerRequestService.sendRequest(conn.id, messages, PROFILE_MAX_TOKENS, {
-            stream: false, extractData: true, includePreset: true, includeInstruct: true,
-        });
-        return typeof res === 'string' ? res : res?.content;
+        const maxTokens = profileMaxTokens(conn);
+        let res = await profileRequest(conn, messages, maxTokens);
+        // 길이 한도에서 끊겼다고 API가 명시했을 때만 한 번, 상한을 늘려 다시 요청.
+        // 텍스트 완성(로컬 모델 등)은 늘리면 문맥 길이를 넘을 수 있어 하지 않는다.
+        const bigger = Math.min(maxTokens * 2, RETRY_MAX_TOKENS);
+        if (res.truncated && conn.mode !== 'tc' && bigger > maxTokens) {
+            console.warn(`[생활기록부] 응답이 길이 한도(${maxTokens})에서 끊겨서 ${bigger}로 한 번 더 요청해요`);
+            try {
+                const again = await profileRequest(conn, messages, bigger);
+                if (String(again.text || '').trim()) res = again;
+            } catch (e) {
+                console.warn('[생활기록부] 다시 요청 실패 — 처음 받은 내용을 써요', e);
+            }
+        }
+        return res.text;
     }
-    // 응답 길이는 일부러 지정하지 않음: 지정하면 생성 중인 본 채팅의 길이 설정과 잠시 겹칠 수 있다
+    // 메인 API 경로. 응답 길이는 일부러 지정하지 않음: 지정하면 생성 중인 본 채팅의 길이 설정과 잠시 겹칠 수 있다.
+    // 채팅 완성은 원본 응답에서 본문만 꺼낸다 — generateRaw 는 채팅용 정리(정규식·이름 자르기·그룹 정리)를 거쳐서 편지가 잘릴 수 있음.
+    // 텍스트 완성은 그 정리(인스트럭트 종료 시퀀스 자르기 등)가 꼭 필요해서 generateRaw 를 그대로 쓴다.
+    if (c.mainApi === 'openai' && typeof c.generateRawData === 'function' && typeof c.extractMessageFromData === 'function') {
+        const data = await c.generateRawData({ prompt: messages });
+        if (hitLengthLimit(data)) console.warn('[생활기록부] 편지가 응답 길이 한도에서 끊겼어요 — 출력 토큰 설정을 늘리거나 연결 프로필을 지정해주세요');
+        return c.extractMessageFromData(data, 'openai');
+    }
     return c.generateRaw({ prompt: messages });
 }
 
@@ -283,7 +395,7 @@ async function writeLetter(snap, mode, conn) {
     } catch { }
     const ch = c.characters[chid];
     const days = Math.max(1, Math.floor((Date.now() - (snap.lastActive || Date.now())) / DAY_MS));
-    const messages = buildLetterPrompt(snap, ch, mode, days, conn.kind === 'profile' ? PROFILE_MAX_TOKENS : mainResponseTokens());
+    const messages = buildLetterPrompt(snap, ch, mode, days, conn.kind === 'profile' ? profileMaxTokens(conn) : mainResponseTokens());
     const raw = await requestText(messages, conn);
     const { paper, body } = takePaper(raw);
     return { text: cleanOutput(body, '빈 편지가 왔어요'), name: ch.name, paper };
